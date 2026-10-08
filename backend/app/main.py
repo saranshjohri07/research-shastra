@@ -1,5 +1,7 @@
 ﻿from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
+from .config import get_settings
 from .errors import unhandled_exception_handler
 from .logging_config import configure_logging
 from .routers.health import router as health_router
@@ -11,6 +13,15 @@ configure_logging()
 app = FastAPI(
     title="ResearchShastra API",
     version="0.1.0",
+)
+
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_settings.cors_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.add_exception_handler(Exception, unhandled_exception_handler)

@@ -1,16 +1,26 @@
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, UploadFile
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..db.models import Paper
 from ..db.session import get_db
 from ..ingestion.pdf_extractor import extract_pdf
+from ..schemas.papers import PaperResponse
 from ..services.indexing_service import index_paper
 from ..services.paper_service import create_paper_record
 from ..services.paper_storage import save_pdf
 
 
 router = APIRouter(prefix="/papers", tags=["papers"])
+
+
+@router.get("/", response_model=list[PaperResponse])
+def list_papers(db: Session = Depends(get_db)) -> list[Paper]:
+    return list(
+        db.scalars(select(Paper).order_by(Paper.created_at.desc())).all()
+    )
 
 
 @router.post("/upload")
