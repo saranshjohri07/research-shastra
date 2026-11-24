@@ -60,6 +60,8 @@ def database():
                     page_start=2,
                     page_end=3,
                     section="Dataset",
+                    vector_status="indexed",
+                    vector_id="chunk-a",
                 ),
                 Chunk(
                     id="chunk-b",
@@ -69,6 +71,8 @@ def database():
                     page_start=1,
                     page_end=1,
                     section="Introduction",
+                    vector_status="indexed",
+                    vector_id="chunk-b",
                 ),
             ]
         )
