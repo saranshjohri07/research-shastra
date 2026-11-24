@@ -27,7 +27,18 @@ def replace_paper_vectors(
         raise ValueError("Each chunk must have exactly one embedding")
 
     collection = get_chroma_collection()
-    collection.delete(where={"paper_id": paper.id})
+    keep_ids = {chunk.id for chunk in chunks}
+    existing = collection.get(
+        where={"paper_id": paper.id},
+        include=[],
+    )
+    stale_ids = [
+        vector_id
+        for vector_id in existing.get("ids", [])
+        if vector_id not in keep_ids
+    ]
+    if stale_ids:
+        collection.delete(ids=stale_ids)
 
     if not chunks:
         return
@@ -45,9 +56,21 @@ def replace_paper_vectors(
         }
         for chunk in chunks
     ]
-    collection.add(
+    collection.upsert(
         ids=[chunk.id for chunk in chunks],
         embeddings=embeddings,
         documents=[chunk.text for chunk in chunks],
         metadatas=metadatas,
     )
+
+
+def delete_stale_paper_vectors(paper_id: str, keep_ids: set[str]) -> None:
+    collection = get_chroma_collection()
+    existing = collection.get(where={"paper_id": paper_id}, include=[])
+    stale_ids = [
+        vector_id
+        for vector_id in existing.get("ids", [])
+        if vector_id not in keep_ids
+    ]
+    if stale_ids:
+        collection.delete(ids=stale_ids)

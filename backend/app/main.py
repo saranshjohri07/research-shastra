@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import get_settings
 from .errors import unhandled_exception_handler
 from .logging_config import configure_logging
+from .routers.conversations import router as conversations_router
 from .routers.health import router as health_router
 from .routers.papers import router as papers_router
 from .routers.research import router as research_router
@@ -29,3 +30,4 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 app.include_router(health_router)
 app.include_router(papers_router)
 app.include_router(research_router)
+app.include_router(conversations_router)

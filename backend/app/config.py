@@ -9,7 +9,10 @@ class Settings(BaseSettings):
     groq_model: str = "openai/gpt-oss-120b"
     embedding_model: str = "BAAI/bge-base-en-v1.5"
     retrieval_min_similarity: float = Field(default=0.25, ge=0.0, le=1.0)
-    database_url: str = "sqlite:///./data/researchshastra.db"
+    database_url: str = (
+        "postgresql+psycopg://researchshastra:researchshastra_dev"
+        "@127.0.0.1:5432/researchshastra"
+    )
     chroma_path: str = "./data/chroma"
     upload_dir: str = "./data/uploads"
     checkpoint_db_path: str = "./data/checkpoints.db"

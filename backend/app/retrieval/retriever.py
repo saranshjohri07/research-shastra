@@ -44,7 +44,11 @@ def retrieve_evidence(
     rows = db.execute(
         select(Chunk, Paper)
         .join(Paper, Paper.id == Chunk.paper_id)
-        .where(Chunk.id.in_(chunk_ids), Chunk.paper_id == paper_id)
+        .where(
+            Chunk.id.in_(chunk_ids),
+            Chunk.paper_id == paper_id,
+            Chunk.vector_status == "indexed",
+        )
     ).all()
     rows_by_id = {chunk.id: (chunk, paper) for chunk, paper in rows}
 
