@@ -25,6 +25,7 @@ class ResearchState(TypedDict, total=False):
     selected_evidence: list[RetrievedEvidence]
     confidence: float
     user_decision: Literal["continue", "flag"] | None
+    user_feedback: str | None
     draft_answer: str | None
     answerable: bool
     abstention_reason: str | None

@@ -2,6 +2,7 @@ import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from langgraph.types import interrupt
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
@@ -234,25 +235,54 @@ def evidence_gatherer(state: ResearchState) -> ResearchState:
 
 
 def human_checkpoint(state: ResearchState) -> ResearchState:
-    decision = state.get("user_decision")
-    if decision is None:
+    started = add_trace(
+        state,
+        "human_checkpoint",
+        "started",
+        "Human review decision is required",
+    )
+    resume_value = interrupt(
+        {
+            "type": "human_review",
+            "question": state["question"],
+            "evidence": [
+                {
+                    "evidence_id": item.evidence_id,
+                    "chunk_id": item.chunk_id,
+                    "paper_id": item.paper_id,
+                    "title": item.title,
+                    "filename": item.filename,
+                    "page_start": item.page_start,
+                    "page_end": item.page_end,
+                    "section": item.section,
+                    "text": item.text,
+                    "similarity": item.similarity,
+                }
+                for item in state.get("selected_evidence", [])
+            ],
+        }
+    )
+    if not isinstance(resume_value, dict):
         trace = add_trace(
-            state,
+            {**state, "trace": started},
             "human_checkpoint",
-            "started",
-            "Human review decision is required",
+            "failed",
+            "Invalid human review decision",
             {"decision": None},
         )
         return {
             **state,
-            "user_decision": None,
-            "status": "awaiting_review",
-            "error": None,
+            "status": "failed",
+            "error": "Invalid human review decision",
             "trace": trace,
         }
-    if decision not in ("continue", "flag"):
+    decision = resume_value.get("decision")
+    feedback = resume_value.get("feedback")
+    if decision not in ("approved", "rejected") or (
+        feedback is not None and not isinstance(feedback, str)
+    ):
         trace = add_trace(
-            state,
+            {**state, "trace": started},
             "human_checkpoint",
             "failed",
             "Invalid human review decision",
@@ -264,17 +294,19 @@ def human_checkpoint(state: ResearchState) -> ResearchState:
             "error": "Invalid human review decision",
             "trace": trace,
         }
+    user_decision = "continue" if decision == "approved" else "flag"
     trace = add_trace(
-        state,
+        {**state, "trace": started},
         "human_checkpoint",
-        "completed" if decision == "continue" else "flagged",
-        "Continue decision received" if decision == "continue" else "Run flagged for human review",
+        "completed" if decision == "approved" else "flagged",
+        "Approval received" if decision == "approved" else "Run rejected during human review",
         {"decision": decision},
     )
     return {
         **state,
-        "user_decision": decision,
-        "status": "running" if decision == "continue" else "flagged",
+        "user_decision": user_decision,
+        "user_feedback": feedback,
+        "status": "running" if decision == "approved" else "flagged",
         "trace": trace,
     }
 

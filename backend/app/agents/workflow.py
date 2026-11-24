@@ -1,5 +1,6 @@
 from typing import Callable
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
@@ -41,7 +42,10 @@ def route_after_reasoner(state: ResearchState) -> str:
     return "citation_agent"
 
 
-def build_research_graph(db: Session):
+def build_research_graph(
+    db: Session,
+    checkpointer: BaseCheckpointSaver | None = None,
+):
     graph = StateGraph(ResearchState)
 
     graph.add_node("planner", planner)
@@ -84,4 +88,4 @@ def build_research_graph(db: Session):
     )
     graph.add_edge("citation_agent", "validator")
     graph.add_edge("validator", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
