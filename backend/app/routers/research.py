@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -24,6 +24,7 @@ from ..schemas.research import (
     ResearchQueryResponse,
 )
 from ..services.research_service import answer_research_query
+from ..services.research_recovery import persist_graph_result
 from ..agents.workflow import build_research_graph
 
 
@@ -292,6 +293,65 @@ def resume_research_run(
             detail="Unable to persist the research run resume decision",
         ) from error
 
+    locked_run = db.scalar(
+        select(ResearchRun)
+        .where(ResearchRun.id == run.id)
+        .with_for_update()
+    )
+    if (
+        locked_run is None
+        or locked_run.resume_token != resume_token
+    ):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Research run resume is being handled by recovery",
+        )
+    if locked_run.status != "running":
+        db.commit()
+        return get_research_run(research_run_id, http_request, db)
+
+    try:
+        locked_snapshot = graph.get_state(config)
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The persisted decision remains available, but its checkpoint "
+                "could not be revalidated for resume"
+            ),
+        ) from error
+    if locked_snapshot.values.get("thread_id") != thread_id:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Saved checkpoint identity does not match the research run",
+        )
+    locked_interrupts = [
+        item
+        for item in locked_snapshot.interrupts
+        if isinstance(getattr(item, "value", None), dict)
+        and item.value.get("type") == "human_review"
+    ]
+    locked_configurable = (
+        getattr(locked_snapshot, "config", None) or {}
+    ).get("configurable", {})
+    if (
+        not locked_interrupts
+        or locked_configurable.get("checkpoint_id") != checkpoint_id
+        or locked_configurable.get("checkpoint_ns") != checkpoint_ns
+    ):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "The persisted decision is awaiting checkpoint recovery; "
+                "the graph was not resumed a second time"
+            ),
+        )
+    run = locked_run
+
     try:
         result = dict(
             graph.invoke(
@@ -306,11 +366,17 @@ def resume_research_run(
         )
     except Exception as error:
         db.rollback()
-        failed_run = db.get(ResearchRun, str(research_run_id))
-        if failed_run is not None:
-            failed_run.status = "failed"
-            failed_run.error = str(error)
-            failed_run.completed_at = datetime.now(timezone.utc)
+        pending_run = db.scalar(
+            select(ResearchRun)
+            .where(
+                ResearchRun.id == str(research_run_id),
+                ResearchRun.status == "running",
+                ResearchRun.resume_token == resume_token,
+            )
+            .with_for_update()
+        )
+        if pending_run is not None:
+            pending_run.error = f"Research run recovery pending: {error}"
             try:
                 db.commit()
             except Exception:
@@ -319,22 +385,11 @@ def resume_research_run(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
                 "Unable to resume the saved research checkpoint; "
-                "the resume claim remains consumed"
+                "the persisted decision remains available for recovery"
             ),
         ) from error
 
-    run.status = {
-        "completed": "completed",
-        "abstained": "abstained",
-        "failed": "failed",
-        "flagged": "cancelled",
-    }.get(result.get("status"), "running")
-    run.answer = result.get("draft_answer")
-    run.answerable = result.get("answerable")
-    run.error = result.get("error")
-    run.abstention_reason = result.get("abstention_reason")
-    if run.status in {"completed", "abstained", "failed", "cancelled"}:
-        run.completed_at = datetime.now(timezone.utc)
+    persist_graph_result(run, result)
     try:
         db.commit()
     except Exception as error:
@@ -352,6 +407,64 @@ def resume_research_run(
     if pending_interrupts:
         result["interrupts"] = [item.value for item in pending_interrupts]
         result["status"] = "awaiting_review"
+    return GraphResearchResponse(**result, research_run_id=run.id)
+
+
+@router.get(
+    "/runs/{research_run_id}",
+    response_model=GraphResearchResponse,
+)
+def get_research_run(
+    research_run_id: UUID,
+    http_request: Request,
+    db: Session = Depends(get_db),
+) -> GraphResearchResponse:
+    run = db.get(ResearchRun, str(research_run_id))
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Research run not found",
+        )
+    thread_id = run.thread_id
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Research run has no valid persisted thread_id",
+        )
+
+    resources = getattr(http_request.app.state, "checkpointer_resources", None)
+    if resources is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LangGraph checkpointer is not initialized",
+        )
+
+    config = {"configurable": {"thread_id": thread_id}}
+    graph = build_research_graph(db, checkpointer=resources.saver)
+    try:
+        snapshot = graph.get_state(config)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to restore the saved research checkpoint",
+        ) from error
+    if snapshot.values.get("thread_id") != thread_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Saved checkpoint identity does not match the research run",
+        )
+
+    result = dict(snapshot.values)
+    if snapshot.interrupts:
+        result["interrupts"] = [item.value for item in snapshot.interrupts]
+        result["status"] = (
+            "awaiting_review" if run.resume_token is None else run.status
+        )
+    else:
+        result["status"] = (
+            "flagged" if run.status == "cancelled" else run.status
+        )
+    result["error"] = run.error or result.get("error")
     return GraphResearchResponse(**result, research_run_id=run.id)
 
 

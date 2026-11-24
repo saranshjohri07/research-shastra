@@ -11,6 +11,7 @@ from .routers.health import router as health_router
 from .routers.papers import router as papers_router
 from .routers.research import router as research_router
 from .checkpointer import build_checkpointer, close_checkpointer
+from .services.research_recovery import recover_pending_research_runs
 
 configure_logging()
 
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI):
     try:
         checkpointer_resources = build_checkpointer(database_url)
         app.state.checkpointer_resources = checkpointer_resources
+        recover_pending_research_runs(checkpointer_resources.saver)
         yield
     finally:
         if checkpointer_resources is not None:

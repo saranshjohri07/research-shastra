@@ -108,7 +108,7 @@ def test_saver_setup_failure_closes_pool(monkeypatch):
 
 def test_lifespan_initializes_and_closes(monkeypatch):
     app = FastAPI()
-    lifecycle = {"started": False, "closed": False}
+    lifecycle = {"started": False, "recovered": False, "closed": False}
 
     monkeypatch.setattr(main_module, "get_settings", lambda: SimpleNamespace(
         database_url="postgresql+psycopg://user:pass@localhost:5432/db"
@@ -123,12 +123,18 @@ def test_lifespan_initializes_and_closes(monkeypatch):
         "close_checkpointer",
         lambda resources: lifecycle.update(closed=True),
     )
+    monkeypatch.setattr(
+        main_module,
+        "recover_pending_research_runs",
+        lambda saver: lifecycle.update(recovered=True),
+    )
 
     import asyncio
 
     async def run():
         async with main_module.lifespan(app):
             assert lifecycle["started"] is True
+            assert lifecycle["recovered"] is True
             assert app.state.checkpointer_resources is not None
 
     asyncio.run(run())

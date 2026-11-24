@@ -106,6 +106,18 @@ class RouteDb:
             return SimpleNamespace(rowcount=1)
         return SimpleNamespace(rowcount=0)
 
+    def scalar(self, statement):
+        parameters = statement.compile().params
+        return next(
+            (
+                row
+                for row in self.rows
+                if isinstance(row, ResearchRun)
+                and row.id in parameters.values()
+            ),
+            None,
+        )
+
     def rollback(self):
         for row in self.rows:
             if isinstance(row, ResearchRun):
@@ -1082,8 +1094,9 @@ def test_resume_route_does_not_restart_after_graph_exception(monkeypatch):
     assert captured["state_config"] == captured["invoke_config"]
     assert captured["invoke_config"]["configurable"]["thread_id"] == thread_id
     assert run.thread_id == thread_id
-    assert run.status == "failed"
+    assert run.status == "running"
     assert run.resume_token is not None
+    assert "recovery pending" in run.error
     assert db.commits == 2
     decisions = [
         row for row in db.rows if isinstance(row, HumanCheckpointDecision)
@@ -1148,6 +1161,81 @@ def test_resume_route_returns_404_for_unknown_run():
         json={"decision": "approved"},
     )
     assert response.status_code == 404
+
+
+def test_get_research_run_restores_result_from_persisted_thread(monkeypatch):
+    run_id = str(uuid4())
+    thread_id = str(uuid4())
+    run = ResearchRun(
+        id=run_id,
+        question="Question",
+        status="completed",
+        thread_id=thread_id,
+        answer="Grounded answer.",
+        answerable=True,
+    )
+    db = RouteDb()
+    db.rows.append(run)
+    captured = {}
+
+    class FakeGraph:
+        def get_state(self, config):
+            captured["config"] = config
+            return SimpleNamespace(
+                values={
+                    **base_state(thread_id=thread_id),
+                    "status": "completed",
+                    "draft_answer": "Grounded answer.",
+                    "answerable": True,
+                    "citations": [],
+                    "selected_evidence": [],
+                },
+                interrupts=[],
+            )
+
+    monkeypatch.setattr(
+        research_router,
+        "build_research_graph",
+        lambda request_db, checkpointer: FakeGraph(),
+    )
+    response = graph_route_client(db).get(f"/research/runs/{run_id}")
+
+    assert response.status_code == 200
+    assert response.json()["research_run_id"] == run_id
+    assert response.json()["thread_id"] == thread_id
+    assert response.json()["status"] == "completed"
+    assert response.json()["draft_answer"] == "Grounded answer."
+    assert captured["config"] == {"configurable": {"thread_id": thread_id}}
+
+
+def test_get_research_run_rejects_mismatched_checkpoint_identity(monkeypatch):
+    run_id = str(uuid4())
+    thread_id = str(uuid4())
+    run = ResearchRun(
+        id=run_id,
+        question="Question",
+        status="running",
+        thread_id=thread_id,
+    )
+    db = RouteDb()
+    db.rows.append(run)
+
+    class FakeGraph:
+        def get_state(self, config):
+            return SimpleNamespace(
+                values=base_state(thread_id=str(uuid4())),
+                interrupts=[],
+            )
+
+    monkeypatch.setattr(
+        research_router,
+        "build_research_graph",
+        lambda request_db, checkpointer: FakeGraph(),
+    )
+    response = graph_route_client(db).get(f"/research/runs/{run_id}")
+
+    assert response.status_code == 409
+    assert "identity does not match" in response.text
 
 
 def test_graph_response_schema_is_declared_in_openapi():

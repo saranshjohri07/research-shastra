@@ -21,6 +21,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
+from backend.app.agents.workflow import build_research_graph
+from backend.app.checkpointer import build_checkpointer, close_checkpointer
 from backend.app.db.base import Base
 from backend.app.db import models  # noqa: F401
 from backend.app.db.models import Paper, ResearchRun
@@ -33,6 +35,7 @@ import sys
 import os
 
 import psycopg
+from langgraph.types import Command
 from sqlalchemy.engine import make_url
 
 from backend.app.agents import stages
@@ -68,6 +71,30 @@ def generate_test_answer(question, context):
 
 stages.retrieve_evidence = retrieve_test_evidence
 stages.generate_grounded_answer = generate_test_answer
+
+from backend.app.routers import research as research_router
+
+original_build_research_graph = research_router.build_research_graph
+
+
+def build_route_graph(db, checkpointer=None):
+    graph = original_build_research_graph(db, checkpointer=checkpointer)
+    if os.environ.get("CRASH_BEFORE_GRAPH_RESUME") != "1":
+        return graph
+
+    class CrashBeforeResume:
+        def __getattr__(self, name):
+            return getattr(graph, name)
+
+        def invoke(self, graph_input, *args, **kwargs):
+            if isinstance(graph_input, Command):
+                os._exit(73)
+            return graph.invoke(graph_input, *args, **kwargs)
+
+    return CrashBeforeResume()
+
+
+research_router.build_research_graph = build_route_graph
 
 for stage_name in ("reasoner", "citation_agent", "validator"):
     original_stage = getattr(workflow, stage_name)
@@ -119,13 +146,20 @@ def isolated_schema_url(base_url: str, schema: str) -> str:
     ).render_as_string(hide_password=False)
 
 
-def start_application(database_url: str, port: int) -> subprocess.Popen:
+def start_application(
+    database_url: str,
+    port: int,
+    crash_before_resume: bool = False,
+) -> subprocess.Popen:
     environment = os.environ.copy()
     environment.update(
         {
             "DATABASE_URL": database_url,
             "GROQ_API_KEY": "process-restart-integration-test",
             "PYTHONUNBUFFERED": "1",
+            "CRASH_BEFORE_GRAPH_RESUME": (
+                "1" if crash_before_resume else "0"
+            ),
         }
     )
     return subprocess.Popen(
@@ -169,6 +203,27 @@ def stop_application(process: subprocess.Popen) -> None:
         )
 
 
+def cleanup_application(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        if process.returncode not in (0, 73):
+            output = process.stdout.read() if process.stdout else ""
+            raise AssertionError(
+                f"Application exited unexpectedly with "
+                f"{process.returncode}:\n{output}"
+            )
+        return
+
+    if os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        process.send_signal(signal.SIGTERM)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 def wait_for_application(process: subprocess.Popen, url: str) -> None:
     deadline = time.monotonic() + 30
     last_error = None
@@ -194,6 +249,11 @@ def post_json(url: str, payload: dict) -> dict:
         method="POST",
     )
     with urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
+def get_json(url: str) -> dict:
+    with urlopen(url, timeout=15) as response:
         return json.load(response)
 
 
@@ -407,14 +467,13 @@ def test_http_resume_survives_full_application_process_restart():
             ),
         }
     finally:
-        shutdown_error = None
+        shutdown_errors = []
+        for process in reversed(processes):
+            try:
+                cleanup_application(process)
+            except AssertionError as error:
+                shutdown_errors.append(error)
         try:
-            for process in reversed(processes):
-                if process.poll() is None:
-                    stop_application(process)
-        except AssertionError as error:
-            shutdown_error = error
-        finally:
             engine.dispose()
             with psycopg.connect(admin_url, autocommit=True) as connection:
                 connection.execute(
@@ -422,5 +481,262 @@ def test_http_resume_survives_full_application_process_restart():
                         sql.Identifier(schema)
                     )
                 )
-        if shutdown_error is not None:
-            raise shutdown_error
+        finally:
+            if shutdown_errors:
+                raise shutdown_errors[0]
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_status", "expected_counts"),
+    [
+        (
+            "approved",
+            "completed",
+            {"reasoner": 1, "citation_agent": 1, "validator": 1},
+        ),
+        ("rejected", "cancelled", {}),
+    ],
+)
+def test_http_recovers_decision_after_process_dies_before_graph_resume(
+    decision,
+    expected_status,
+    expected_counts,
+):
+    base_url = os.environ.get(TEST_DATABASE_URL_ENV)
+    if not base_url:
+        pytest.skip(
+            f"Set {TEST_DATABASE_URL_ENV} to a disposable PostgreSQL test database"
+        )
+
+    database_name = urlsplit(base_url).path.rsplit("/", 1)[-1].split("?", 1)[0]
+    if "test" not in database_name.lower():
+        pytest.fail(
+            f"{TEST_DATABASE_URL_ENV} must name a dedicated test database"
+        )
+    repository_root = Path(__file__).resolve().parents[2]
+    configured_database_url = (
+        os.environ.get("DATABASE_URL")
+        or dotenv_values(repository_root / ".env").get("DATABASE_URL")
+        or (
+            "postgresql+psycopg://researchshastra:researchshastra_dev"
+            "@127.0.0.1:5432/researchshastra"
+        )
+    )
+    if make_url(base_url).database == make_url(configured_database_url).database:
+        pytest.fail(
+            f"{TEST_DATABASE_URL_ENV} must not target the configured application database"
+        )
+
+    schema = f"rs_decision_recovery_{uuid4().hex}"
+    schema_url = isolated_schema_url(base_url, schema)
+    admin_url = make_url(base_url).set(drivername="postgresql").render_as_string(
+        hide_password=False
+    )
+    with psycopg.connect(admin_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema))
+        )
+
+    engine = create_engine(schema_url, pool_pre_ping=True)
+    processes = []
+    checkpointer_resources = None
+    run_threads = []
+    try:
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE restart_stage_counts ("
+                    "stage TEXT PRIMARY KEY, executions INTEGER NOT NULL)"
+                )
+            )
+        paper_id = str(uuid4())
+        with Session(engine) as db:
+            db.add(
+                Paper(
+                    id=paper_id,
+                    title="Decision recovery fixture",
+                    filename="decision-recovery.pdf",
+                    file_path="decision-recovery.pdf",
+                    page_count=1,
+                )
+            )
+            db.commit()
+
+        port = free_local_port()
+        base_app_url = f"http://127.0.0.1:{port}"
+        first_process = start_application(
+            schema_url,
+            port,
+            crash_before_resume=True,
+        )
+        processes.append(first_process)
+        wait_for_application(first_process, base_app_url)
+
+        pending_responses = [
+            post_json(
+                f"{base_app_url}/research/graph/query",
+                {"paper_ids": [paper_id], "question": "What supports the answer?"},
+            )
+            for _ in range(2)
+        ]
+        assert all(
+            response["status"] == "awaiting_review"
+            for response in pending_responses
+        )
+        run_id = pending_responses[0]["research_run_id"]
+        thread_id = pending_responses[0]["thread_id"]
+        untouched_run_id = pending_responses[1]["research_run_id"]
+        untouched_thread_id = pending_responses[1]["thread_id"]
+        run_threads.extend((thread_id, untouched_thread_id))
+
+        try:
+            post_json(
+                f"{base_app_url}/research/runs/{run_id}/resume",
+                {"decision": decision, "feedback": "Persist before crash"},
+            )
+            pytest.fail("The process unexpectedly returned from graph resume")
+        except HTTPError as error:
+            pytest.fail(
+                f"The process returned an HTTP response instead of crashing: {error}"
+            )
+        except (OSError, URLError):
+            pass
+
+        assert first_process.wait(timeout=20) == 73
+        with Session(engine) as db:
+            interrupted_run = db.get(ResearchRun, run_id)
+            untouched_run = db.get(ResearchRun, untouched_run_id)
+            decision_rows = db.execute(
+                text(
+                    "SELECT research_run_id::text, thread_id, checkpoint_ns, "
+                    "checkpoint_id, decision, comment "
+                    "FROM human_checkpoint_decisions"
+                )
+            ).all()
+        assert interrupted_run.status == "running"
+        assert interrupted_run.thread_id == thread_id
+        assert interrupted_run.resume_token is not None
+        assert untouched_run.status == "running"
+        assert untouched_run.thread_id == untouched_thread_id
+        assert untouched_run.resume_token is None
+        assert len(decision_rows) == 1
+        (
+            stored_run_id,
+            stored_thread_id,
+            checkpoint_ns,
+            checkpoint_id,
+            stored_decision,
+            stored_comment,
+        ) = decision_rows[0]
+        assert stored_run_id == run_id
+        assert stored_thread_id == thread_id
+        assert checkpoint_id
+        assert stored_decision == decision
+        assert stored_comment == "Persist before crash"
+
+        recovery_processes = []
+        recovery_urls = []
+        for _ in range(2):
+            recovery_port = free_local_port()
+            recovery_url = f"http://127.0.0.1:{recovery_port}"
+            recovery_urls.append(recovery_url)
+            process = start_application(schema_url, recovery_port)
+            recovery_processes.append(process)
+            processes.append(process)
+        for process, recovery_url in zip(recovery_processes, recovery_urls):
+            wait_for_application(process, recovery_url)
+
+        with Session(engine) as db:
+            recovered_run = db.get(ResearchRun, run_id)
+            still_paused_run = db.get(ResearchRun, untouched_run_id)
+            counts = dict(
+                db.execute(
+                    text("SELECT stage, executions FROM restart_stage_counts")
+                ).all()
+            )
+            persisted_decisions = db.execute(
+                text(
+                    "SELECT research_run_id::text, thread_id, checkpoint_ns, "
+                    "checkpoint_id, decision, comment "
+                    "FROM human_checkpoint_decisions"
+                )
+            ).all()
+        assert recovered_run.status == expected_status
+        assert recovered_run.thread_id == thread_id
+        assert recovered_run.error is None
+        assert recovered_run.completed_at is not None
+        assert still_paused_run.status == "running"
+        assert still_paused_run.thread_id == untouched_thread_id
+        assert still_paused_run.resume_token is None
+        assert counts == expected_counts
+        assert persisted_decisions == [
+            (
+                run_id,
+                thread_id,
+                checkpoint_ns,
+                checkpoint_id,
+                decision,
+                "Persist before crash",
+            )
+        ]
+        recovered_response = get_json(
+            f"{recovery_urls[0]}/research/runs/{run_id}"
+        )
+        assert recovered_response["research_run_id"] == run_id
+        assert recovered_response["thread_id"] == thread_id
+        assert recovered_response["status"] == (
+            "flagged" if decision == "rejected" else expected_status
+        )
+        if decision == "approved":
+            assert recovered_response["draft_answer"] == (
+                "The fixture supports this answer [E1]."
+            )
+
+        checkpointer_url = make_url(schema_url).set(
+            drivername="postgresql"
+        ).render_as_string(hide_password=False)
+        checkpointer_resources = build_checkpointer(checkpointer_url)
+        with Session(engine) as db:
+            graph = build_research_graph(db, checkpointer_resources.saver)
+            history = list(
+                graph.get_state_history(
+                    {"configurable": {"thread_id": thread_id}},
+                    limit=100,
+                )
+            )
+            untouched_snapshot = graph.get_state(
+                {"configurable": {"thread_id": untouched_thread_id}}
+            )
+        assert any(
+            item.config["configurable"].get("thread_id") == thread_id
+            and item.config["configurable"].get("checkpoint_ns", "")
+            == (checkpoint_ns or "")
+            and item.config["configurable"].get("checkpoint_id") == checkpoint_id
+            for item in history
+        )
+        assert untouched_snapshot.interrupts[0].value["type"] == "human_review"
+    finally:
+        shutdown_errors = []
+        for process in reversed(processes):
+            try:
+                cleanup_application(process)
+            except AssertionError as error:
+                shutdown_errors.append(error)
+        try:
+            if checkpointer_resources is not None:
+                try:
+                    for thread_id in run_threads:
+                        checkpointer_resources.saver.delete_thread(thread_id)
+                finally:
+                    close_checkpointer(checkpointer_resources)
+            engine.dispose()
+            with psycopg.connect(admin_url, autocommit=True) as connection:
+                connection.execute(
+                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                        sql.Identifier(schema)
+                    )
+                )
+        finally:
+            if shutdown_errors:
+                raise shutdown_errors[0]
